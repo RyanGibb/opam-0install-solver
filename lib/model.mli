@@ -17,7 +17,7 @@
 module Make (Context : S.CONTEXT) : sig
   include Zeroinstall_solver.S.SOLVER_INPUT with type rejection = Context.rejection
 
-  val role : Context.t -> OpamPackage.Name.t -> Role.t
+  val role : Context.t -> OpamPackage.t -> Role.t
 
   val version : impl -> OpamPackage.t option
   (** [version impl] is the Opam package for [impl], if any.
@@ -28,7 +28,7 @@ module Make (Context : S.CONTEXT) : sig
       This is used if the user requests multiple packages on the command line
       (the single [impl] will also be virtual). *)
 
-  val virtual_impl : context:Context.t -> depends:OpamPackage.Name.t list -> unit -> impl
+  val virtual_impl : context:Context.t -> depends:OpamPackage.t list -> unit -> impl
   (** [virtual_impl ~context ~depends ()] is a virtual package which just depends
       on [depends]. This is used if the user requests multiple packages on the
       command line - each requested package becomes a dependency of the virtual
@@ -42,4 +42,9 @@ module Make (Context : S.CONTEXT) : sig
   (** [formula restriction] returns the version formula represented by this
       restriction along with its negation status: [(`Prevent, formula)] roughly
       means [not formula]. *)
+
+  val role_from_pkg_names : context:Context.t -> OpamPackage.Name.t list -> Role.t
+  (** [role_from_pkg_names pkg_names] is a virtual package that depends on all
+      the packages in pkg_names with version constraints from
+      [Context.user_restrictions]. *)
 end

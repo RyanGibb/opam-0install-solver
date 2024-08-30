@@ -5,14 +5,8 @@ module Make(Context : S.CONTEXT) = struct
   let package_name = Input.package_name
   let formula = Input.formula
 
-  let requirements ~context pkgs =
-    let role =
-      match pkgs with
-      | [pkg] -> Input.role context pkg
-      | pkgs ->
-        let impl = Input.virtual_impl ~context ~depends:pkgs () in
-        Input.virtual_role [impl]
-    in
+  let requirements ~context (pkg_names : OpamPackage.Name.t list) =
+    let role = Input.role_from_pkg_names ~context pkg_names in
     { Input.role; command = None }
 
   module Solver = Zeroinstall_solver.Make(Input)
