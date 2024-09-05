@@ -6,9 +6,13 @@ module Make (Context : S.CONTEXT) = struct
     expr : OpamFormula.version_formula;
   }
 
+  type role_package =
+    | Name of OpamPackage.Name.t
+    | Version of OpamPackage.t
+
   type real_role = {
     context : Context.t;
-    package : OpamPackage.t;
+    package : role_package;
   }
 
   type role =
@@ -42,7 +46,10 @@ module Make (Context : S.CONTEXT) = struct
     | VirtualImpl _ as x -> pp_version f x
     | Dummy -> Fmt.string f "(no solution found)"
   and pp_role f = function
-    | Real t -> Fmt.string f (OpamPackage.to_string t.package)
+    | Real t ->
+        (match t.package with
+        | Version package -> Fmt.string f (OpamPackage.to_string package)
+        | Name name -> Fmt.string f (OpamPackage.Name.to_string name))
     | Virtual (_, impls) -> Fmt.pf f "%a" Fmt.(list ~sep:(any "|") pp_impl) impls
 
   let pp_impl_long = pp_impl
@@ -54,7 +61,12 @@ module Make (Context : S.CONTEXT) = struct
 
     let compare a b =
       match a, b with
-      | Real a, Real b -> OpamPackage.compare a.package b.package
+      | Real a, Real b ->
+          (match a.package, b.package with
+          | Name name_a, Name name_b -> OpamPackage.Name.compare name_a name_b
+          | Version package_a, Version package_b -> OpamPackage.compare package_a package_b
+          | Name name_a, Version package_b -> OpamPackage.Name.compare name_a package_b.name
+          | Version package_a, Name name_b -> OpamPackage.Name.compare package_a.name name_b)
       | Virtual (a, _), Virtual (b, _) -> compare a b
       | Real _, Virtual _ -> -1
       | Virtual _, Real _ -> 1
@@ -63,8 +75,8 @@ module Make (Context : S.CONTEXT) = struct
   let role context package = Real { context; package }
 
   let virtual_impl ~context ~depends () =
-    let depends = depends |> List.map (fun name ->
-        let drole = role context name in
+    let depends = depends |> List.map (fun package ->
+        let drole = role context package in
         let importance = `Essential in
         { drole; importance; restrictions = []}
       ) in
@@ -151,10 +163,10 @@ module Make (Context : S.CONTEXT) = struct
     |> List.rev
     |> List.filter_map (function
       | _, Error _rejection -> None
-      | version, Ok _opam ->
+      | version, Ok opam ->
         match OpamFormula.check_version_formula expr version with
         | false -> None
-        | true -> Some version
+        | true -> Some (version, opam)
     )
 
   (* Opam uses conflicts, e.g.
@@ -167,58 +179,118 @@ module Make (Context : S.CONTEXT) = struct
      list). But for the version expressions inside, it's wrong: a conflict with no expression
      conflicts with all versions and should restrict the choice to nothing, not to everything.
      So, we just tag the formula as [`Prevent] instead of negating it. *)
-  let prevent context f =
+
+  let prevent f =
+    OpamFormula.neg Fun.id f
+    |> OpamFormula.map (fun (a, expr) -> OpamFormula.Atom (Name a, [{ kind = `Prevent; expr }]))
+
+  let multiple_versions_prevent context f =
     OpamFormula.neg Fun.id f
     |> OpamFormula.map (fun (name, expr) ->
       candidate_versions context name expr
-      |> List.fold_left (fun acc version ->
+      |> List.fold_left (fun acc (version, _opam) ->
           (* we've already done check_version_formula *)
           let expr = OpamFormula.Empty in
           let restrictions = [{ kind = `Prevent; expr }] in
           let pkg = OpamPackage.create name version in
-          let atom = OpamFormula.Atom (pkg, restrictions) in
+          let atom = OpamFormula.Atom (Version pkg, restrictions) in
           match acc with
           | None -> Some atom
           | Some acc -> Some (OpamFormula.Or (atom, acc))
       ) None
-      |> Option.get
+      |> Option.fold ~none:OpamFormula.Empty ~some:Stdlib.Fun.id 
     )
 
-  let ensure context f =
-    OpamFormula.map (fun (name, expr) ->
-      let version = List.hd (List.rev (candidate_versions context name expr)) in
-      OpamFormula.Atom (OpamPackage.create name version, [])
+  let ensure f =
+    OpamFormula.map (fun (name, vexpr) ->
+      let rlist =
+        match vexpr with
+        | OpamFormula.Empty -> []
+        | r                 -> [{ kind = `Ensure; expr = r }]
+      in
+      OpamFormula.Atom (Name name, rlist)
     ) f
+
+  let multiple_versions_ensure context f =
+    OpamFormula.map (fun (name, expr) ->
+      match List.rev (candidate_versions context name expr) with
+      | (version, _opam) :: _ ->
+        let package = OpamPackage.create name version in
+        OpamFormula.Atom (Version package, [])
+      | _ -> OpamFormula.Empty
+    ) f
+
+  let multiple_versions_from_opam opam =
+    let extensions = OpamFile.OPAM.extensions opam in
+    match OpamStd.String.Map.find_opt "x-multiple-versions" extensions with
+    | None -> false
+    | Some value ->
+      match value.pelem with
+      | OpamParserTypes.FullPos.Bool b -> b
+      | _ -> false
+
+  let implementations_aux opam pkg context =
+    let multiple_versions = multiple_versions_from_opam opam in
+    match multiple_versions with
+    | false ->
+      (* Note: we ignore depopts here: see opam/doc/design/depopts-and-features *)
+      let requires =
+        let rank = ref 0 in
+        let make_deps importance xform get =
+          get opam
+          |> Context.filter_deps context pkg
+          |> xform
+          |> list_deps ~context ~importance ~rank
+        in
+        make_deps `Essential ensure OpamFile.OPAM.depends @
+        make_deps `Restricts prevent OpamFile.OPAM.conflicts
+      in
+      RealImpl { context; pkg; opam; requires }
+    | true ->
+      let requires =
+        let rank = ref 0 in
+        let make_deps importance xform get =
+          get opam
+          |> Context.filter_deps context pkg
+          |> xform context
+          |> list_deps ~context ~importance ~rank
+        in
+        make_deps `Essential multiple_versions_ensure OpamFile.OPAM.depends @
+        make_deps `Restricts multiple_versions_prevent OpamFile.OPAM.conflicts
+      in
+      RealImpl { context; pkg; opam; requires }
 
   (* Get all the candidates for a role. *)
   let implementations = function
     | Virtual (_, impls) -> { impls; replacement = None }
     | Real real_role ->
       let context = real_role.context in
-      let impls =
-      let pkg = real_role.package in
-      let opam = Context.load context pkg in
-        let requires =
-          let rank = ref 0 in
-          let make_deps importance xform get =
-            get opam
-            |> Context.filter_deps context pkg
-            |> xform context
-            |> list_deps ~context ~importance ~rank
-          in
-          make_deps `Essential ensure OpamFile.OPAM.depends @
-          make_deps `Restricts prevent OpamFile.OPAM.conflicts
-        in
-        [ RealImpl { context; pkg; opam; requires } ]
+      let impls = match real_role.package with
+      | Name name ->
+        Context.candidates context name
+        |> List.filter_map (function
+            | _, Error _rejection -> None
+            | version, Ok opam ->
+              let pkg = OpamPackage.create name version in
+              Some (implementations_aux opam pkg context)
+          )
+      | Version pkg ->
+        let opam = Context.load context pkg in
+        [ implementations_aux opam pkg context ]
       in
       { impls; replacement = None }
 
-  let role_from_pkg_names ~context pkg_names =
+  let root_role ~context pkg_names =
     let depends = List.map (function name ->
         let candidate_versions = candidate_versions context name (OpamFormula.Empty) in
-        let impls = List.map (function version ->
-            let pkg = OpamPackage.create name version in
-            let depends = [ pkg ] in
+        let impls = List.map (function version, opam ->
+            let multiple_versions = multiple_versions_from_opam opam in
+            let depends = match multiple_versions with
+              | false -> [ (Name name) ]
+              | true ->
+                let pkg = OpamPackage.create name version in
+                [ (Version pkg) ]
+            in
             let vimpl = virtual_impl ~context ~depends () in
             vimpl
           ) candidate_versions
@@ -252,11 +324,12 @@ module Make (Context : S.CONTEXT) = struct
     | Real role ->
       let context = role.context in
       let rejects =
-        Context.candidates context role.package.name
+        let name = match role.package with Name name -> name | Version package -> package.name in
+        Context.candidates context name
         |> List.filter_map (function
             | _, Ok _ -> None
             | version, Error reason ->
-              let pkg = OpamPackage.create role.package.name version in
+              let pkg = OpamPackage.create name version in
               Some (Reject pkg, reason)
           )
       in
@@ -275,7 +348,8 @@ module Make (Context : S.CONTEXT) = struct
   let user_restrictions = function
     | Virtual _ -> None
     | Real role ->
-      match Context.user_restrictions role.context role.package.name with
+      let name = match role.package with Name name -> name | Version package -> package.name in
+      match Context.user_restrictions role.context name with
       | None -> None
       | Some f -> Some { kind = `Ensure; expr = OpamFormula.Atom f }
 
@@ -307,7 +381,10 @@ module Make (Context : S.CONTEXT) = struct
     | Dummy -> None
 
   let package_name = function
-    | Real {package; _} -> Some package.name
+    | Real {package; _} ->
+        (match package with
+        | Name name -> Some name
+        | Version package -> Some package.name)
     | Virtual _ -> None
 
   let formula { kind; expr } = (kind, expr)
