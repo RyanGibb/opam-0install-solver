@@ -11,7 +11,7 @@ let env =
 
 module Solver = Opam_0install.Solver.Make(Opam_0install.Dir_context)
 
-let select repo verbose spec =
+let select repo verbose graph spec =
   let result = match spec with
   | [] -> OpamConsole.error "No packages requested!"; `Bad_arguments
   | spec ->
@@ -28,9 +28,14 @@ let select repo verbose spec =
     let r = Solver.solve context pkgs in
     match r with
     | Ok selections ->
-      Fmt.pr "%a@." Fmt.(list ~sep:(any " ") pp_pkg) (Solver.packages_of_result selections);
-      Solver.packages_of_result selections
-      |> List.iter (fun pkg -> Printf.printf "- %s\n" (OpamPackage.to_string pkg));
+      begin match graph with
+        | Some config -> Fmt.pr "%a@." (Graph.output config ~pkgs) selections
+        | None -> (
+          Fmt.pr "%a@." Fmt.(list ~sep:(any " ") pp_pkg) (Solver.packages_of_result selections);
+          Solver.packages_of_result selections
+          |> List.iter (fun pkg -> Printf.printf "- %s\n" (OpamPackage.to_string pkg))
+        )
+      end;
       `Success
     | Error problem ->
       OpamConsole.error "No solution";
@@ -86,7 +91,7 @@ let cmd =
   let doc = "Select opam packages using 0install backend" in
   let info = Cmd.info "opam-0install" ~doc in
   let term =
-    Term.(const select $ repo $ verbose $ Arg.value spec)
+    Term.(const select $ repo $ verbose $ Graph.cmdliner $ Arg.value spec)
   in
   Cmd.v info term
 
